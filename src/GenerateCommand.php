@@ -95,6 +95,7 @@ class GenerateCommand extends Command
             $named->undot()->each($this->writeBarrelFiles(...));
 
             $this->writeContent();
+            $this->writeLocalizedRouteWrappers();
 
             info('[Wayfinder] Generated routes in '.$this->base());
         }
@@ -351,6 +352,105 @@ class GenerateCommand extends Command
         $base = $this->option('path') ?? join_paths(resource_path(), 'js');
 
         return join_paths($base, $this->pathDirectory);
+    }
+
+    private function writeLocalizedRouteWrappers(): void
+    {
+        $base = $this->base();
+
+        $supportedLocales = collect(config('localized-routes.supported_locales', []))
+            ->filter(fn($locale) => is_string($locale) && $locale !== '')
+            ->values();
+
+        if ($supportedLocales->isEmpty()) {
+            return;
+        }
+
+        $availableLocales = $supportedLocales
+            ->filter(fn(string $locale) => $this->files->isDirectory(join_paths($base, $locale)))
+            ->values();
+
+        if ($availableLocales->isEmpty()) {
+            return;
+        }
+
+        $fallbackLocale = config('localized-routes.fallback_locale');
+
+        if (!is_string($fallbackLocale) || !$availableLocales->contains($fallbackLocale)) {
+            $fallbackLocale = $availableLocales->first();
+        }
+
+        if (!is_string($fallbackLocale)) {
+            return;
+        }
+
+        $fallbackPath = join_paths($base, $fallbackLocale);
+
+        $relativeIndexPaths = collect($this->files->allFiles($fallbackPath))
+            ->filter(fn($file) => $file->getFilename() === 'index.ts')
+            ->map(function ($file) use ($fallbackPath) {
+                return str_replace('\\', '/', Str::after($file->getPathname(), $fallbackPath . DIRECTORY_SEPARATOR));
+            })
+            ->values();
+
+        $relativeIndexPaths->each(function (string $relativeIndexPath) use ($availableLocales, $fallbackLocale, $base): void {
+            if ($relativeIndexPath === 'index.ts') {
+                return;
+            }
+
+            $existsForAllLocales = $availableLocales->every(function (string $locale) use ($base, $relativeIndexPath): bool {
+                return $this->files->exists(join_paths($base, $locale, $relativeIndexPath));
+            });
+
+            if (!$existsForAllLocales) {
+                return;
+            }
+
+            $importSuffix = '/' . Str::beforeLast($relativeIndexPath, '/index.ts');
+            $wrapperRelativePath = Str::replaceLast('/index.ts', '.ts', $relativeIndexPath);
+            $wrapperPath = join_paths($base, $wrapperRelativePath);
+            $wrapperDirectory = dirname($wrapperPath);
+
+            $this->files->ensureDirectoryExists($wrapperDirectory);
+
+            $imports = $availableLocales
+                ->map(fn(string $locale) => "import {$locale} from './{$locale}{$importSuffix}'")
+                ->implode(PHP_EOL);
+
+            $localeObject = $availableLocales
+                ->map(fn(string $locale) => "    {$locale},")
+                ->implode(PHP_EOL);
+
+            $fallbackLocaleLiteral = var_export($fallbackLocale, true);
+
+            $content = <<<TYPESCRIPT
+            {$imports}
+
+            const modules = {
+            {$localeObject}
+            } as const
+
+            const resolveLocale = () => {
+                if (typeof document === 'undefined') {
+                    return {$fallbackLocaleLiteral}
+                }
+
+                const lang = document.documentElement?.lang?.trim().toLowerCase()
+
+                if (! lang) {
+                    return {$fallbackLocaleLiteral}
+                }
+
+                return lang.split('-')[0] || {$fallbackLocaleLiteral}
+            }
+
+            const locale = resolveLocale()
+
+            export default modules[locale as keyof typeof modules] ?? modules[{$fallbackLocaleLiteral}]
+            TYPESCRIPT;
+
+            $this->files->put($wrapperPath, TypeScript::cleanUp($content));
+        });
     }
 
     private function getDefaultsForMiddleware(string $middleware)
